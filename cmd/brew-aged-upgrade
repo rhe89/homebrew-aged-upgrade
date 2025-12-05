@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# brew tap rhe/aged-upgrade
+# brew tap 
+# brew tap homebrew/cask --force
+
+# brew aged-upgrade
+#
+# Oppgraderer bare pakker (formulae og/eller casks) der siste commit på
+# formula-/cask-filen er eldre enn N dager.
+#
+# Avhenger av:
+#   - git
+#   - jq
+#
+# Eksempler:
+#   brew aged-upgrade                   # default 7 dager, både formula + cask
+#   brew aged-upgrade --days 14         # 14 dager
+#   brew aged-upgrade --formula         # kun formula
+#   brew aged-upgrade --cask            # kun casks
+#   brew aged-upgrade --days 3 --cask   # kun casks eldre enn 3 dager
+
+set -euo pipefail
+
+DAYS=7
+ONLY_FORMULA=0
+ONLY_CASK=0
+
+usage() {
+  cat <<EOF
+Usage: brew aged-upgrade [options]
+
+Options:
+  --days N        Minimum alder i dager på siste commit (default: 7)
+  --formula       Bare formulae
+  --cask          Bare casks
+  -h, --help      Vis denne hjelpen
+
+Eksempler:
+  brew aged-upgrade
+  brew aged-upgrade --days 14
+  brew aged-upgrade --formula
+  brew aged-upgrade --days 3 --cask
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --days)
+      shift
+      if [[ $# -eq 0 ]]; then
+        echo "Error: --days trenger en verdi" >&2
+        exit 1
+      fi
+      DAYS="$1"
+      ;;
+    --formula)
+      ONLY_FORMULA=1
+      ;;
+    --cask)
+      ONLY_CASK=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Ukjent flagg: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "Error: jq er påkrevd. Installer med: brew install jq" >&2
+  exit 1
+fi
+
+if ! command -v git >/dev/null 2>&1; then
+  echo "Error: git er påkrevd." >&2
+  exit 1
+fi
+
+if ! [[ "$DAYS" =~ ^[0-9]+$ ]]; then
+  echo "Error: --days må være heltall, fikk: $DAYS" >&2
+  exit 1
+fi
+
+NOW_TS=$(date +%s)
+CUTOFF_TS=$(( NOW_TS - DAYS * 86400 ))
+
+echo "brew aged-upgrade: oppgraderer bare pakker der siste commit er eldre enn $DAYS dager."
+echo "Cutoff timestamp: $CUTOFF_TS"
+echo
+
+# global liste over kandidater som skal oppgraderes
+declare -a upgrade_list=()
+
+gather_outdated() {
+  local type="$1" # "formula" eller "cask"
+  local outdated
+
+  if [[ "$type" == "formula" ]]; then
+    outdated=$(brew outdated --formula --quiet || true)
+  else
+    outdated=$(brew outdated --cask --quiet || true)
+  fi
+
+  if [[ -z "$outdated" ]]; then
+    echo "Ingen utdaterte $type."
+    echo
+    return
+  fi
+
+  echo "Utdaterte $type:"
+  echo "$outdated"
+  echo
+
+  while read -r pkg; do
+    [[ -z "$pkg" ]] && continue
+
+    echo "Analyserer $type: $pkg"
+
+    # Hent info via brew info --json=v2
+    local info_json
+    if [[ "$type" == "formula" ]]; then
+      # formulae: toppnivå er en array
+      info_json=$(brew info --formula --json=v2 "$pkg" 2>/dev/null | jq '.[0]')
+    else
+      # casks: toppnivå er et objekt med nøkkelen "casks"
+      info_json=$(brew info --cask --json=v2 "$pkg" 2>/dev/null | jq '.casks[0]')
+    fi
+
+    if [[ -z "$info_json" || "$info_json" == "null" ]]; then
+      echo "  Fant ikke info for $pkg, hopper over."
+      echo
+      continue
+    fi
+
+    # For både formula og cask bruker vi tap + ruby_source_path
+    local tap ruby_rel
+    tap=$(echo "$info_json" | jq -r '.tap // empty')
+    ruby_rel=$(echo "$info_json" | jq -r '.ruby_source_path // empty')
+
+    if [[ -z "$tap" || -z "$ruby_rel" || "$ruby_rel" == "null" ]]; then
+      echo "  Fant ikke tap/ruby_source_path for $pkg, hopper over."
+      echo
+      continue
+    fi
+
+    # Finn repo-root for tap
+    local repo_root
+    repo_root=$(brew --repo "$tap" 2>/dev/null || true)
+
+    echo "repo_root: $repo_root"
+    # brew --repo $repo_root
+    
+    if [[ -z "$repo_root" || ! -d "$repo_root" ]]; then
+      echo "  Fant ikke repo-root for tap $tap, hopper over."
+      echo
+      continue
+    fi
+
+    local path
+    path="$repo_root/$ruby_rel"
+
+    if [[ ! -f "$path" ]]; then
+      echo "  Fant ikke filen $path for $pkg, hopper over."
+      echo
+      continue
+    fi
+
+    # Siste commit-tid (unix timestamp) for akkurat denne filen
+    local commit_ts
+    commit_ts=$(git -C "$repo_root" log -1 --format=%ct -- "$path" 2>/dev/null || true)
+    if [[ -z "$commit_ts" ]]; then
+      echo "  Fant ikke commit-historikk for $path, hopper over."
+      echo
+      continue
+    fi
+
+    local age_sec age_days
+    age_sec=$(( NOW_TS - commit_ts ))
+    age_days=$(( age_sec / 86400 ))
+
+    echo "  Siste commit TS: $commit_ts (ca. ${age_days} dager gammel)"
+
+    if (( commit_ts <= CUTOFF_TS )); then
+      echo "  -> Kvalifiserer (eldre enn $DAYS dager), legger til for oppgradering."
+      upgrade_list+=("$type:$pkg")
+    else
+      echo "  -> For fersk, hopper over."
+    fi
+
+    echo
+  done <<< "$outdated"
+}
+
+# Bestem hva vi skal se på
+if [[ "$ONLY_CASK" -eq 1 && "$ONLY_FORMULA" -eq 0 ]]; then
+  gather_outdated "cask"
+elif [[ "$ONLY_FORMULA" -eq 1 && "$ONLY_CASK" -eq 0 ]]; then
+  gather_outdated "formula"
+else
+  gather_outdated "formula"
+  echo "---------------------------"
+  gather_outdated "cask"
+fi
+
+if [[ "${#upgrade_list[@]}" -eq 0 ]]; then
+  echo "Ingen pakker oppfylte alderskravet ($DAYS dager)."
+  exit 0
+fi
+
+echo "Følgende pakker vil oppgraderes (type:navn):"
+for entry in "${upgrade_list[@]}"; do
+  echo "  $entry"
+done
+echo
+
+# Kjør selve oppgraderingen
+for entry in "${upgrade_list[@]}"; do
+  type="${entry%%:*}"
+  pkg="${entry##*:}"
+
+  if [[ "$type" == "cask" ]]; then
+    echo "Oppgraderer cask: $pkg"
+    brew upgrade --cask "$pkg"
+  else
+    echo "Oppgraderer formula: $pkg"
+    brew upgrade "$pkg"
+  fi
+done
+
+echo
+echo "Ferdig."
