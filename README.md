@@ -1,18 +1,7 @@
-# Rhe Aged-upgrade
+```sh
+brew tap roar/aged-upgrade
+brew tap homebrew/cask --force
+brew install jq
 
-## How do I install these formulae?
-
-`brew install rhe/aged-upgrade/<formula>`
-
-Or `brew tap rhe/aged-upgrade` and then `brew install <formula>`.
-
-Or, in a `brew bundle` `Brewfile`:
-
-```ruby
-tap "rhe/aged-upgrade"
-brew "<formula>"
+brew aged-upgrade --days 10
 ```
-
-## Documentation
-
-`brew help`, `man brew` or check [Homebrew's documentation](https://docs.brew.sh).
