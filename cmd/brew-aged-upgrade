@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 # brew tap rhe/aged-upgrade
 # brew tap 
-# brew tap homebrew/cask --force
-
 # brew aged-upgrade
 #
 # Oppgraderer bare pakker (formulae og/eller casks) der siste commit på
@@ -42,6 +40,9 @@ Eksempler:
   brew aged-upgrade --days 3 --cask
 EOF
 }
+
+brew tap homebrew/cask --force
+brew tap homebrew/core --force
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -125,8 +126,8 @@ gather_outdated() {
     # Hent info via brew info --json=v2
     local info_json
     if [[ "$type" == "formula" ]]; then
-      # formulae: toppnivå er en array
-      info_json=$(brew info --formula --json=v2 "$pkg" 2>/dev/null | jq '.[0]')
+      # formulae: toppnivå er et objekt med nøkkelen "formulae"
+      info_json=$(brew info --formula --json=v2 "$pkg" 2>/dev/null | jq '.formulae[0]')
     else
       # casks: toppnivå er et objekt med nøkkelen "casks"
       info_json=$(brew info --cask --json=v2 "$pkg" 2>/dev/null | jq '.casks[0]')
