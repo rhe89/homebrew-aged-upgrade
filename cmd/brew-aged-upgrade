@@ -3,8 +3,9 @@
 # brew tap 
 # brew aged-upgrade
 #
-# Oppgraderer bare pakker (formulae og/eller casks) der siste commit på
-# formula-/cask-filen er eldre enn N dager.
+# Oppgraderer pakker (formulae og/eller casks) til den nyeste versjonen der
+# formula-/cask-filen er eldre enn N dager. Hvis siste versjon er for fersk,
+# brukes siste eldre git-revisjon av formula-/cask-filen.
 #
 # Avhenger av:
 #   - git
@@ -28,7 +29,7 @@ usage() {
 Usage: brew aged-upgrade [options]
 
 Options:
-  --days N        Minimum alder i dager på siste commit (default: 7)
+  --days N        Minimum alder i dager på versjonen som installeres (default: 7)
   --formula       Bare formulae
   --cask          Bare casks
   -h, --help      Vis denne hjelpen
@@ -91,12 +92,28 @@ fi
 NOW_TS=$(date +%s)
 CUTOFF_TS=$(( NOW_TS - DAYS * 86400 ))
 
-echo "brew aged-upgrade: oppgraderer bare pakker der siste commit er eldre enn $DAYS dager."
+echo "brew aged-upgrade: oppgraderer til nyeste pakkeversjon som er eldre enn $DAYS dager."
 echo "Cutoff timestamp: $CUTOFF_TS"
 echo
 
 # global liste over kandidater som skal oppgraderes
 declare -a upgrade_list=()
+declare -a restore_list=()
+
+restore_checked_out_files() {
+  local entry repo_root ruby_rel
+
+  for entry in "${restore_list[@]}"; do
+    repo_root="${entry%%|*}"
+    ruby_rel="${entry#*|}"
+
+    if [[ -d "$repo_root" ]]; then
+      git -C "$repo_root" checkout -- "$ruby_rel" >/dev/null 2>&1 || true
+    fi
+  done
+}
+
+trap restore_checked_out_files EXIT
 
 gather_outdated() {
   local type="$1" # "formula" eller "cask"
@@ -173,8 +190,9 @@ gather_outdated() {
     fi
 
     # Siste commit-tid (unix timestamp) for akkurat denne filen
-    local commit_ts
+    local commit_ts latest_commit
     commit_ts=$(git -C "$repo_root" log -1 --format=%ct -- "$path" 2>/dev/null || true)
+    latest_commit=$(git -C "$repo_root" log -1 --format=%H -- "$path" 2>/dev/null || true)
     if [[ -z "$commit_ts" ]]; then
       echo "  Fant ikke commit-historikk for $path, hopper over."
       echo
@@ -187,13 +205,40 @@ gather_outdated() {
 
     echo "  Siste commit TS: $commit_ts (ca. ${age_days} dager gammel)"
 
+    local selected_commit selected_ts selected_age_sec selected_age_days needs_checkout
+    selected_commit="$latest_commit"
+    selected_ts="$commit_ts"
+    needs_checkout=0
+
     if (( commit_ts <= CUTOFF_TS )); then
-      echo "  -> Kvalifiserer (eldre enn $DAYS dager), legger til for oppgradering."
-      upgrade_list+=("$type:$pkg")
+      echo "  -> Siste versjon kvalifiserer (eldre enn $DAYS dager)."
     else
-      echo "  -> For fersk, hopper over."
+      echo "  -> Siste versjon er for fersk, finner nyeste eldre revisjon."
+
+      selected_commit=$(git -C "$repo_root" log -1 --before="@$CUTOFF_TS" --format=%H -- "$ruby_rel" 2>/dev/null || true)
+
+      if [[ -z "$selected_commit" ]]; then
+        echo "  Fant ingen eldre revisjon for $pkg, hopper over."
+        echo
+        continue
+      fi
+
+      selected_ts=$(git -C "$repo_root" show -s --format=%ct "$selected_commit" 2>/dev/null || true)
+      if [[ -z "$selected_ts" ]]; then
+        echo "  Fant ikke tidspunkt for eldre revisjon $selected_commit, hopper over."
+        echo
+        continue
+      fi
+
+      selected_age_sec=$(( NOW_TS - selected_ts ))
+      selected_age_days=$(( selected_age_sec / 86400 ))
+      needs_checkout=1
+
+      echo "  -> Valgt revisjon ${selected_commit:0:12} (ca. ${selected_age_days} dager gammel)."
     fi
 
+    upgrade_list+=("$type|$pkg|$repo_root|$ruby_rel|$selected_commit|$needs_checkout")
+    echo "  -> Legger til for oppgradering."
     echo
   done <<< "$outdated"
 }
@@ -216,21 +261,40 @@ fi
 
 echo "Følgende pakker vil oppgraderes (type:navn):"
 for entry in "${upgrade_list[@]}"; do
-  echo "  $entry"
+  IFS='|' read -r type pkg repo_root ruby_rel selected_commit needs_checkout <<< "$entry"
+  if [[ "$needs_checkout" -eq 1 ]]; then
+    echo "  $type:$pkg @ ${selected_commit:0:12}"
+  else
+    echo "  $type:$pkg"
+  fi
 done
 echo
 
 # Kjør selve oppgraderingen
 for entry in "${upgrade_list[@]}"; do
-  type="${entry%%:*}"
-  pkg="${entry##*:}"
+  IFS='|' read -r type pkg repo_root ruby_rel selected_commit needs_checkout <<< "$entry"
+
+  if [[ "$needs_checkout" -eq 1 ]]; then
+    if ! git -C "$repo_root" diff --quiet -- "$ruby_rel" || ! git -C "$repo_root" diff --cached --quiet -- "$ruby_rel"; then
+      echo "Hopper over $type:$pkg fordi $ruby_rel har lokale endringer i $repo_root."
+      continue
+    fi
+
+    echo "Bruker eldre revisjon for $type:$pkg: ${selected_commit:0:12}"
+    git -C "$repo_root" checkout "$selected_commit" -- "$ruby_rel"
+    restore_list+=("$repo_root|$ruby_rel")
+  fi
 
   if [[ "$type" == "cask" ]]; then
     echo "Oppgraderer cask: $pkg"
-    brew upgrade --cask "$pkg"
+    HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_FROM_API=1 brew upgrade --cask "$pkg"
   else
     echo "Oppgraderer formula: $pkg"
-    brew upgrade "$pkg"
+    HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_FROM_API=1 brew upgrade "$pkg"
+  fi
+
+  if [[ "$needs_checkout" -eq 1 ]]; then
+    git -C "$repo_root" checkout -- "$ruby_rel"
   fi
 done
 
